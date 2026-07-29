@@ -10,6 +10,9 @@ import type { OpenAiSettingsStore } from "../settings/openai-settings";
 import type { PageExtractor } from "./types";
 
 export class AstreaExtractor implements PageExtractor {
+  private extractionPage?: Page;
+  private extractionQueue: Promise<void> = Promise.resolve();
+
   constructor(
     private readonly browserController: BrowserController,
     private readonly openAiSettings: OpenAiSettingsStore,
@@ -34,11 +37,8 @@ export class AstreaExtractor implements PageExtractor {
     ocrProvider?: OcrProvider;
     openAiModel?: OpenAiOcrModel;
   }) {
-    const browser = await this.browserController.getConnectedBrowser();
-    const context = browser.contexts()[0] ?? (await browser.newContext());
-    const tab = await context.newPage();
-
-    try {
+    return this.runExclusive(async () => {
+      const tab = await this.getExtractionPage();
       const provider = ocrProvider ?? "openai";
       const text = await this.extractFromReaderUi(
         tab,
@@ -53,9 +53,38 @@ export class AstreaExtractor implements PageExtractor {
         text,
         method: this.methodForProvider(),
       };
+    });
+  }
+
+  private async runExclusive<T>(operation: () => Promise<T>): Promise<T> {
+    const previousOperation = this.extractionQueue;
+    let releaseQueue!: () => void;
+    this.extractionQueue = new Promise<void>((resolve) => {
+      releaseQueue = resolve;
+    });
+
+    await previousOperation.catch(() => undefined);
+
+    try {
+      return await operation();
     } finally {
-      await tab.close().catch(() => undefined);
+      releaseQueue();
     }
+  }
+
+  private async getExtractionPage(): Promise<Page> {
+    if (this.extractionPage && !this.extractionPage.isClosed()) {
+      return this.extractionPage;
+    }
+
+    const browser = await this.browserController.getConnectedBrowser();
+    const context = browser.contexts()[0] ?? (await browser.newContext());
+    this.extractionPage = await context.newPage();
+    this.extractionPage.once("close", () => {
+      this.extractionPage = undefined;
+    });
+
+    return this.extractionPage;
   }
 
   private async extractFromReaderUi(

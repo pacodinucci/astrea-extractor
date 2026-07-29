@@ -31,13 +31,7 @@ export class BrowserController {
           );
         }
 
-        this.process = spawn(executablePath, [
-          `--remote-debugging-port=${this.cdpPort}`,
-          `--user-data-dir=${this.profilePath}`,
-          "--no-first-run",
-          "--no-default-browser-check",
-          ASTREA_BASE_URL,
-        ], {
+        this.process = spawn(executablePath, this.getChromiumLaunchArgs(), {
           detached: false,
           stdio: "ignore",
         });
@@ -111,6 +105,24 @@ export class BrowserController {
     if (!existsSync(this.profilePath)) {
       mkdirSync(this.profilePath, { recursive: true });
     }
+  }
+
+  private getChromiumLaunchArgs(): string[] {
+    const args = [
+      `--remote-debugging-port=${this.cdpPort}`,
+      `--user-data-dir=${this.profilePath}`,
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-popup-blocking",
+      "--disable-features=Translate,MediaRouter,OptimizationGuideModelDownloading",
+      ASTREA_BASE_URL,
+    ];
+
+    if (process.platform === "darwin") {
+      args.splice(args.length - 1, 0, "--window-size=1280,900");
+    }
+
+    return args;
   }
 
   private getChromiumExecutablePath(): string | undefined {
