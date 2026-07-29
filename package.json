@@ -1,0 +1,104 @@
+{
+    "name":  "astrea-extractor",
+    "version":  "0.1.0",
+    "private":  true,
+    "description":  "Local Electron tool for extracting text from Astrea Virtual reader pages for Claude.",
+    "main":  "out/main/index.js",
+    "type":  "module",
+    "scripts":  {
+                    "dev":  "electron-vite dev",
+                    "test":  "vitest run",
+                    "test:watch":  "vitest",
+                    "lint":  "eslint .",
+                    "typecheck":  "tsc --noEmit",
+                    "package":  "electron-vite build && electron-builder --dir",
+                    "dist":  "electron-vite build && electron-builder",
+                    "build":  "electron-vite build",
+                    "dist:win":  "electron-vite build && electron-builder --win --x64 -c.directories.output=release/windows",
+                    "dist:mac":  "electron-vite build && electron-builder --mac --universal -c.directories.output=release/macos"
+                },
+    "dependencies":  {
+                         "@fastify/cors":  "^11.3.0",
+                         "@vitejs/plugin-react":  "^5.1.2",
+                         "class-variance-authority":  "latest",
+                         "clsx":  "latest",
+                         "electron-store":  "latest",
+                         "fastify":  "latest",
+                         "lucide-react":  "latest",
+                         "nanoid":  "latest",
+                         "pdf-parse":  "latest",
+                         "playwright":  "^1.62.0",
+                         "playwright-core":  "latest",
+                         "radix-ui":  "^1.6.7",
+                         "react":  "latest",
+                         "react-dom":  "latest",
+                         "tailwind-merge":  "latest",
+                         "tailwindcss":  "latest",
+                         "zod":  "latest"
+                     },
+    "devDependencies":  {
+                            "@electron-toolkit/preload":  "latest",
+                            "@electron-toolkit/utils":  "latest",
+                            "@tailwindcss/vite":  "^4.3.3",
+                            "@types/node":  "latest",
+                            "@types/react":  "latest",
+                            "@types/react-dom":  "latest",
+                            "@typescript-eslint/eslint-plugin":  "latest",
+                            "@typescript-eslint/parser":  "latest",
+                            "electron":  "latest",
+                            "electron-builder":  "latest",
+                            "electron-vite":  "^5.0.0",
+                            "eslint":  "latest",
+                            "typescript":  "latest",
+                            "vite":  "^7.3.6",
+                            "vitest":  "latest"
+                        },
+    "build":  {
+                  "appId":  "com.local.astreaextractor",
+                  "productName":  "Astrea Extractor",
+                  "asar":  true,
+                  "directories":  {
+                                      "output":  "release"
+                                  },
+                  "files":  [
+                                "out/**",
+                                "package.json"
+                            ],
+                  "mac":  {
+                              "target":  [
+                                             {
+                                                 "target":  "dmg",
+                                                 "arch":  [
+                                                              "universal"
+                                                          ]
+                                             },
+                                             {
+                                                 "target":  "zip",
+                                                 "arch":  [
+                                                              "universal"
+                                                          ]
+                                             }
+                                         ],
+                              "identity":  null,
+                              "artifactName":  "${productName}-${version}-mac-${arch}.${ext}"
+                          },
+                  "win":  {
+                              "target":  [
+                                             {
+                                                 "target":  "nsis",
+                                                 "arch":  [
+                                                              "x64"
+                                                          ]
+                                             }
+                                         ],
+                              "artifactName":  "${productName}-Setup-${version}-win-${arch}.${ext}"
+                          },
+                  "nsis":  {
+                               "oneClick":  false,
+                               "allowToChangeInstallationDirectory":  true,
+                               "createDesktopShortcut":  true,
+                               "createStartMenuShortcut":  true,
+                               "shortcutName":  "Astrea Extractor"
+                           }
+              }
+}

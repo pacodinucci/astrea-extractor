@@ -1,0 +1,179 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Astrea Extractor Local API",
+    "version": "0.1.0"
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:4317"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Get local API and browser status",
+        "responses": {
+          "200": {
+            "description": "Runtime status"
+          }
+        }
+      }
+    },
+    "/browser/open": {
+      "post": {
+        "summary": "Open managed Chromium at Astrea Virtual",
+        "responses": {
+          "200": {
+            "description": "Browser status"
+          }
+        }
+      }
+    },
+    "/browser/status": {
+      "get": {
+        "summary": "Get managed Chromium status",
+        "responses": {
+          "200": {
+            "description": "Browser status"
+          }
+        }
+      }
+    },
+    "/extract": {
+      "post": {
+        "summary": "Create an extraction job",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExtractionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Job queued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateExtractionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          }
+        }
+      }
+    },
+    "/extract/{jobId}": {
+      "get": {
+        "summary": "Get extraction job status/result",
+        "parameters": [
+          {
+            "name": "jobId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Extraction job",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtractionJob"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Job not found"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ExtractionRequest": {
+        "type": "object",
+        "properties": {
+          "bookcode": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "pages": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "required": ["pages"],
+        "anyOf": [
+          { "required": ["bookcode"] },
+          { "required": ["title"] }
+        ]
+      },
+      "CreateExtractionResponse": {
+        "type": "object",
+        "properties": {
+          "jobId": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["queued"]
+          }
+        },
+        "required": ["jobId", "status"]
+      },
+      "ExtractionJob": {
+        "type": "object",
+        "properties": {
+          "jobId": { "type": "string" },
+          "status": {
+            "type": "string",
+            "enum": ["queued", "processing", "completed", "failed"]
+          },
+          "bookcode": { "type": "string" },
+          "title": { "type": "string" },
+          "requestedPages": {
+            "type": "array",
+            "items": { "type": "integer" }
+          },
+          "combinedText": { "type": "string" },
+          "pages": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "page": { "type": "integer" },
+                "text": { "type": "string" },
+                "method": {
+                  "type": "string",
+                  "enum": ["pdf_text_layer", "pdf_buffer"]
+                },
+                "attempts": { "type": "integer" },
+                "status": { "type": "string", "enum": ["completed"] }
+              }
+            }
+          }
+        },
+        "required": ["jobId", "status", "requestedPages", "pages"]
+      }
+    }
+  }
+}

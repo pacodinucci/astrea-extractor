@@ -1,0 +1,695 @@
+﻿import type { Frame, Page } from "playwright";
+import {
+  ASTREA_BASE_URL,
+  type ExtractionRequest,
+  type OcrProvider,
+  type OpenAiOcrModel,
+} from "../../shared/extraction";
+import type { BrowserController } from "../browser/browser-controller";
+import type { OpenAiSettingsStore } from "../settings/openai-settings";
+import type { PageExtractor } from "./types";
+
+export class AstreaExtractor implements PageExtractor {
+  constructor(
+    private readonly browserController: BrowserController,
+    private readonly openAiSettings: OpenAiSettingsStore,
+  ) {}
+
+  async resolveBookcode(request: ExtractionRequest): Promise<string> {
+    if (request.bookcode) return request.bookcode;
+    throw new Error(
+      "El fallback por title todavía requiere desambiguación manual. Enviá bookcode para el MVP.",
+    );
+  }
+
+  async extractPage({
+    bookcode,
+    page,
+    ocrProvider,
+    openAiModel,
+  }: {
+    bookcode: string;
+    page: number;
+    attempt: number;
+    ocrProvider?: OcrProvider;
+    openAiModel?: OpenAiOcrModel;
+  }) {
+    const browser = await this.browserController.getConnectedBrowser();
+    const context = browser.contexts()[0] ?? (await browser.newContext());
+    const tab = await context.newPage();
+
+    try {
+      const provider = ocrProvider ?? "openai";
+      const text = await this.extractFromReaderUi(
+        tab,
+        bookcode,
+        page,
+        provider,
+        openAiModel,
+      );
+
+      return {
+        page,
+        text,
+        method: this.methodForProvider(),
+      };
+    } finally {
+      await tab.close().catch(() => undefined);
+    }
+  }
+
+  private async extractFromReaderUi(
+    page: Page,
+    bookcode: string,
+    requestedPage: number,
+    ocrProvider: OcrProvider,
+    openAiModel?: OpenAiOcrModel,
+  ): Promise<string> {
+    await page.goto(`${ASTREA_BASE_URL}/reader/${bookcode}`, {
+      waitUntil: "domcontentloaded",
+    });
+
+    await page.waitForFunction(
+      () =>
+        Boolean(document.querySelector("input.select-pages")) ||
+        document.body.innerText.toLowerCase().includes("iniciar sesi?n") ||
+        document.body.innerText.toLowerCase().includes("login"),
+      undefined,
+      { timeout: 45_000 },
+    );
+
+    const hasReaderControls = await page.locator("input.select-pages").count();
+    if (!hasReaderControls) {
+      const diagnostics = await this.getReaderDiagnostics(page).catch(() => "Sin diagn?stico");
+      throw new Error(`No encontr? el control de p?gina de Astrea. Diagn?stico: ${diagnostics}`);
+    }
+
+    await page.evaluate((targetPage) => {
+      const input = document.querySelector<HTMLInputElement>("input.select-pages");
+      if (!input) throw new Error("No existe input.select-pages");
+
+      input.focus();
+      input.value = String(targetPage);
+      input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: String(targetPage) }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      input.blur();
+    }, requestedPage);
+
+    const goButton = page.locator("button.btn-form-pages").first();
+    await Promise.all([
+      page.waitForResponse(
+        (response) => response.url().includes("/api/files/book/resources/reader/pages"),
+        { timeout: 15_000 },
+      ).catch(() => undefined),
+      goButton.click({ timeout: 10_000, force: true }),
+    ]);
+
+    await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(
+      () => undefined,
+    );
+    await page.waitForTimeout(1_500);
+
+    const text = await this.extractOcrTextFromReader(page, ocrProvider, openAiModel);
+
+    if (!text) {
+      throw new Error(
+        `La página ${requestedPage} se abrió en el reader, pero la capa de texto está vacía.`,
+      );
+    }
+
+    return text;
+  }
+
+
+  private async extractOcrTextFromReader(
+    page: Page,
+    _provider: OcrProvider,
+    openAiModel?: OpenAiOcrModel,
+  ): Promise<string> {
+    const image = await this.captureReaderPageImage(page);
+    const text = (
+      await this.runOpenAiOcr(image, openAiModel ?? this.openAiSettings.getModel())
+    ).trim();
+
+    if (!text) {
+      throw new Error(
+        "OpenAI no encontr? texto en la captura de la p?gina del reader.",
+      );
+    }
+
+    return text;
+  }
+
+  private async runOpenAiOcr(image: Buffer, model: OpenAiOcrModel): Promise<string> {
+    const apiKey = this.openAiSettings.getApiKey();
+    const prompt =
+      "Transcribe exactly the visible text in this image. " +
+      "Do not correct, complete, infer, summarize, or explain. " +
+      "Preserve visible line breaks when possible. " +
+      "If text is unclear, write [ilegible]. " +
+      "Return only the transcription.";
+
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${apiKey}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        reasoning: { effort: "none" },
+        max_output_tokens: 4096,
+        input: [
+          {
+            role: "user",
+            content: [
+              { type: "input_text", text: prompt },
+              {
+                type: "input_image",
+                image_url: `data:image/png;base64,${image.toString("base64")}`,
+              },
+            ],
+          },
+        ],
+      }),
+    });
+
+    const payload = (await response.json()) as {
+      output_text?: string;
+      output?: Array<{
+        content?: Array<{ text?: string; type?: string }>;
+      }>;
+      error?: { message?: string };
+    };
+
+    if (!response.ok) {
+      throw new Error(
+        `OpenAI API fall? (${response.status}): ${payload.error?.message ?? JSON.stringify(payload).slice(0, 1000)}`,
+      );
+    }
+
+    return payload.output_text ?? this.extractResponsesText(payload);
+  }
+
+  private extractResponsesText(payload: {
+    output?: Array<{ content?: Array<{ text?: string; type?: string }> }>;
+  }): string {
+    return (payload.output ?? [])
+      .flatMap((item) => item.content ?? [])
+      .map((content) => content.text ?? "")
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+  }
+
+  private methodForProvider() {
+    return "ocr_openai" as const;
+  }
+
+  private async captureReaderPageImage(page: Page): Promise<Buffer> {
+    await page.waitForFunction(
+      () => Array.from(document.querySelectorAll("canvas")).some((canvas) => canvas.width > 500 && canvas.height > 500),
+      undefined,
+      { timeout: 30_000 },
+    );
+
+    const dataUrl = await page.evaluate(() => {
+      const canvases = Array.from(document.querySelectorAll<HTMLCanvasElement>(".page canvas, canvas"))
+        .map((canvas) => {
+          const rect = canvas.getBoundingClientRect();
+          return {
+            canvas,
+            area: canvas.width * canvas.height,
+            visible: rect.width > 100 && rect.height > 100,
+          };
+        })
+        .filter(({ canvas, visible }) => visible && canvas.width > 500 && canvas.height > 500)
+        .sort((a, b) => b.area - a.area);
+
+      const canvas = canvases[0]?.canvas;
+      if (!canvas) return "";
+
+      return canvas.toDataURL("image/png");
+    });
+
+    if (!dataUrl.startsWith("data:image/png;base64,")) {
+      throw new Error("No pude obtener una imagen PNG de alta resoluci?n desde el canvas del reader.");
+    }
+
+    return Buffer.from(dataUrl.split(",")[1], "base64");
+  }
+
+  private cleanupOcrText(text: string): string {
+    const fixLine = (line: string) =>
+      line
+        .replace(/\s+/g, " ")
+        .replace(/T\s*[???]\s*TULO\s*PRIMERO/gi, "T\u00cdTULO PRIMERO")
+        .replace(/TiTULOPRIMERO|TITULOPRIMERO/gi, "T\u00cdTULO PRIMERO")
+        .replace(/PARTEGENERAL/g, "PARTE GENERAL")
+        .replace(/CAP\s*[???]\s*TULO\s*PRIMERO/gi, "CAP\u00cdTULO PRIMERO")
+        .replace(/CAPITULOPRIMERO/gi, "CAP\u00cdTULO PRIMERO")
+        .replace(/Art\s*[???]\s*culo\s*1[???*??]*/gi, "Art\u00edculo 1\u00ba")
+        .replace(/Articulo\s*1[???*??]*/gi, "Art\u00edculo 1\u00ba")
+        .replace(/[????]*\[\s*PRINCIPIOS\s*DEL\s*PROCEDIMIENTO\s*\][???\s]*/gi, "[Principios del procedimiento] ")
+        .replace(/[????]*\[\s*PRINCIPIOSDELPROCEDIMIENTO\s*\][???\s]*/gi, "[Principios del procedimiento] ")
+        .replace(/PRINCIPIOSDELPROCEDIMIENTO/gi, "Principios del procedimiento")
+        .replace(/\]\s*[-?]\s*/g, "] ? ")
+        .replace(/\]\s*(?=El\b)/g, "] ? ")
+        .replace(/\s+([,.;:!?%)\]])/g, "$1")
+        .replace(/([,.;:!?])(?=\S)/g, "$1 ")
+        .replace(/\bC6\s*-?\s*digo\b/gi, "C\u00f3digo")
+        .replace(/\bambito\b/gi, "\u00e1mbito")
+        .replace(/\?mbito\b/gi, "\u00e1mbito")
+        .replace(/\bAutonoma\b/g, "Aut\u00f3noma")
+        .replace(/Aut\?noma\b/g, "Aut\u00f3noma")
+        .replace(/\bconcentracion\b/gi, "concentraci\u00f3n")
+        .replace(/concentraci\?n\b/gi, "concentraci\u00f3n")
+        .replace(/\bdigitalizacion\b/gi, "digitalizaci\u00f3n")
+        .replace(/digitalizaci\?n\b/gi, "digitalizaci\u00f3n")
+        .replace(/\breglamentacion\b/gi, "reglamentaci\u00f3n")
+        .replace(/reglamentaci\?n\b/gi, "reglamentaci\u00f3n")
+        .replace(/\bconciliacion\b/gi, "conciliaci\u00f3n")
+        .replace(/conciliaci\?n\b/gi, "conciliaci\u00f3n")
+        .replace(/\binmediacion\b/gi, "inmediaci\u00f3n")
+        .replace(/inmediaci\?n\b/gi, "inmediaci\u00f3n")
+        .replace(/\brealizacion\b/gi, "realizaci\u00f3n")
+        .replace(/realizaci\?n\b/gi, "realizaci\u00f3n")
+        .replace(/\bCodigo\b/g, "C\u00f3digo")
+        .replace(/\bprincipios oralidad\b/gi, "principios de oralidad")
+        .replace(/\by(?=sus\b|actos\b|realizaci\u00f3n\b|realizacion\b|virtua\b|efectividad\b)/gi, "y ")
+        .replace(/\bde(?=las\b|la\b|los\b|Buenos\b)/g, "de ")
+        .replace(/\bconforme(?=lo\b)/gi, "conforme ")
+        .replace(/disponenlos/gi, "disponen los")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    return text
+      .replace(/\r\n/g, "\n")
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/-\n(?=\p{Ll})/gu, "")
+      .split("\n")
+      .map((line) => fixLine(line.trim()))
+      .filter(Boolean)
+      .join("\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }
+
+
+  private async extractCleanTextFromAnyFrame(page: Page): Promise<string> {
+    const deadline = Date.now() + 30_000;
+    let lastFrameUrls = "";
+
+    while (Date.now() < deadline) {
+      const frames = page.frames();
+      lastFrameUrls = frames.map((frame) => frame.url()).join(" | ");
+
+      for (const frame of frames) {
+        const pdfText = await this.extractPdfJsText(frame).catch(() => "");
+        if (pdfText) return this.cleanupExtractedText(pdfText);
+
+        const layerText = await this.extractVisibleTextLayer(frame).catch(
+          () => "",
+        );
+        if (layerText) return this.cleanupExtractedText(layerText);
+      }
+
+      await page.waitForTimeout(500);
+    }
+
+    const diagnostics = await this.getReaderDiagnostics(page).catch(
+      (error: unknown) =>
+        error instanceof Error ? error.message : "No se pudieron obtener diagn?sticos",
+    );
+
+    throw new Error(
+      `No encontr? texto extra?ble en el reader. Frames revisados: ${lastFrameUrls}. Diagn?stico: ${diagnostics}`,
+    );
+  }
+
+  private async extractPdfJsText(frame: Frame): Promise<string> {
+    return frame.evaluate(async () => {
+      type TextItem = {
+        str?: string;
+        width?: number;
+        transform?: number[];
+      };
+      type TextContent = { items?: TextItem[] };
+      type PdfPage = { getTextContent: () => Promise<TextContent> };
+      type PdfDocument = { getPage: (pageNumber: number) => Promise<PdfPage> };
+      type PdfJsApp = {
+        page?: number;
+        pdfDocument?: PdfDocument;
+        pdfViewer?: {
+          currentPageNumber?: number;
+          pdfDocument?: PdfDocument;
+        };
+      };
+
+      const app = (globalThis as { PDFViewerApplication?: PdfJsApp })
+        .PDFViewerApplication;
+      const pdfDocument = app?.pdfDocument ?? app?.pdfViewer?.pdfDocument;
+      const pageNumber =
+        app?.pdfViewer?.currentPageNumber ??
+        app?.page ??
+        Number(document.querySelector<HTMLInputElement>("#pageNumber")?.value);
+
+      if (!pdfDocument || !Number.isFinite(pageNumber) || pageNumber < 1) {
+        return "";
+      }
+
+      const pdfPage = await pdfDocument.getPage(pageNumber);
+      const textContent = await pdfPage.getTextContent();
+      const items = (textContent.items ?? [])
+        .map((item) => ({
+          text: (item.str ?? "").trim(),
+          x: item.transform?.[4] ?? 0,
+          y: item.transform?.[5] ?? 0,
+          width: item.width ?? 0,
+        }))
+        .filter((item) => item.text.length > 0);
+
+      if (!items.length) return "";
+
+      items.sort((a, b) => {
+        const yDiff = b.y - a.y;
+        if (Math.abs(yDiff) > 2) return yDiff;
+        return a.x - b.x;
+      });
+
+      const lines: Array<typeof items> = [];
+      for (const item of items) {
+        const currentLine = lines[lines.length - 1];
+        const previous = currentLine?.[0];
+
+        if (!currentLine || !previous || Math.abs(previous.y - item.y) > 2) {
+          lines.push([item]);
+        } else {
+          currentLine.push(item);
+        }
+      }
+
+      const shouldJoinWithoutSpace = (previous: string, next: string) =>
+        previous.endsWith("-") ||
+        /^[,.;:!?%)\]]/.test(next) ||
+        /^[-??]/.test(next);
+
+      return lines
+        .map((line) =>
+          line
+            .sort((a, b) => a.x - b.x)
+            .reduce((acc, item, index, sortedLine) => {
+              if (!acc) return item.text;
+
+              const previous = sortedLine[index - 1];
+              const gap = item.x - (previous.x + previous.width);
+              const separator =
+                shouldJoinWithoutSpace(acc, item.text) || gap < 1 ? "" : " ";
+
+              return `${acc}${separator}${item.text}`;
+            }, ""),
+        )
+        .join("\n")
+        .replace(/[ \t]+\n/g, "\n")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+    });
+  }
+
+  private cleanupExtractedText(text: string): string {
+    const normalizeLine = (line: string) =>
+      line
+        .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+    const comparable = (line: string) =>
+      normalizeLine(line)
+        .toLocaleLowerCase("es")
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .replace(/[^\p{L}\p{N}/]+/gu, "");
+    const isSingleLetter = (value: string) => /^[A-Za-z??????????????]$/u.test(value);
+    const startsWithLowercase = (value: string) => /^[a-z???????]/u.test(value);
+    const startsWithSameLetter = (letter: string, value: string) =>
+      comparable(value).startsWith(comparable(letter));
+    const cleanupLineArtifacts = (line: string) => {
+      const normalized = normalizeLine(line)
+        .replace(/^\[\[\s*/, "[")
+        .replace(/\]\s*\?\s*\?\s*[?-]/g, "] ?")
+        .replace(/\?\s*\?\s*[?-]/g, "?");
+      const tokens = normalized.split(" ").filter(Boolean);
+      const mergedTokens: string[] = [];
+
+      for (let i = 0; i < tokens.length; i += 1) {
+        const token = tokens[i];
+        const next = tokens[i + 1];
+        const previous = mergedTokens[mergedTokens.length - 1];
+
+        if (isSingleLetter(token) && next && startsWithLowercase(next)) {
+          mergedTokens.push(`${token}${next}`);
+          i += 1;
+          continue;
+        }
+
+        if (isSingleLetter(token) && next && startsWithSameLetter(token, next)) {
+          continue;
+        }
+
+        if (previous) {
+          const previousKey = comparable(previous);
+          const tokenKey = comparable(token);
+          if (previousKey === tokenKey || previousKey.endsWith(tokenKey)) {
+            continue;
+          }
+        }
+
+        mergedTokens.push(token);
+      }
+
+      return mergedTokens
+        .join(" ")
+        .replace(/\[\s+/g, "[")
+        .replace(/\s+\]/g, "]")
+        .replace(/\]\s*[??]+\s*[?-]/g, "] ?")
+        .replace(/\s+([,.;:!?%)\]])/g, "$1")
+        .trim();
+    };
+
+    const rawLines = text
+      .split(/\r?\n/)
+      .map(cleanupLineArtifacts)
+      .filter(Boolean);
+    const merged: string[] = [];
+
+    for (let i = 0; i < rawLines.length; i += 1) {
+      const line = rawLines[i];
+      const next = rawLines[i + 1];
+      const previous = merged[merged.length - 1];
+
+      if (previous === line) continue;
+
+      if (previous && (line === "?" || line === "?")) {
+        merged[merged.length - 1] = `${previous}?`;
+        continue;
+      }
+
+      if (isSingleLetter(line) && next && startsWithLowercase(next)) {
+        merged.push(`${line}${next}`);
+        i += 1;
+        continue;
+      }
+
+      if (line === "[" && next) {
+        const parts: string[] = [];
+        let consumed = 0;
+        for (let j = i + 1; j < rawLines.length; j += 1) {
+          consumed += 1;
+          const value = rawLines[j];
+          if (value.startsWith("]")) {
+            const suffix = value.slice(1).trim();
+            merged.push(`[${cleanupLineArtifacts(parts.join(" "))}]${suffix ? ` ${suffix}` : ""}`);
+            i += consumed;
+            break;
+          }
+          parts.push(value);
+        }
+        if (i + consumed >= rawLines.length) merged.push(line);
+        continue;
+      }
+
+      merged.push(line);
+    }
+
+    const cleaned: string[] = [];
+    for (let i = 0; i < merged.length; i += 1) {
+      const line = cleanupLineArtifacts(merged[i]);
+      const previous = cleaned[cleaned.length - 1];
+      if (previous === line) continue;
+      if (previous && line.startsWith("]") && comparable(previous).includes(comparable(line))) continue;
+
+      const lineKey = comparable(line);
+      let duplicateKey = "";
+      let duplicateEnd = i;
+      let matchedPrefix = false;
+
+      for (let j = i + 1; j < merged.length; j += 1) {
+        const candidate = cleanupLineArtifacts(merged[j]);
+        if (candidate.includes(" ") && duplicateKey.length > 0) break;
+
+        const nextKey = duplicateKey + comparable(candidate);
+        if (!lineKey.startsWith(nextKey)) break;
+
+        duplicateKey = nextKey;
+        duplicateEnd = j;
+        matchedPrefix = true;
+        if (duplicateKey === lineKey) break;
+      }
+
+      cleaned.push(line);
+      const enoughDuplicate = duplicateKey.length >= Math.min(lineKey.length, Math.max(8, Math.floor(lineKey.length * 0.6)));
+      if (duplicateEnd > i && matchedPrefix && enoughDuplicate) {
+        i = duplicateEnd;
+      }
+    }
+
+    return cleaned.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  }
+
+  private async extractTextLayerFromAnyFrame(page: Page): Promise<string> {
+    const deadline = Date.now() + 30_000;
+    let lastFrameUrls = "";
+
+    while (Date.now() < deadline) {
+      const frames = page.frames();
+      lastFrameUrls = frames.map((frame) => frame.url()).join(" | ");
+
+      for (const frame of frames) {
+        const text = await this.extractVisibleTextLayer(frame).catch(
+          () => "",
+        );
+
+        if (text) return text;
+      }
+
+      await page.waitForTimeout(500);
+    }
+
+    const diagnostics = await this.getReaderDiagnostics(page).catch(
+      (error: unknown) =>
+        error instanceof Error ? error.message : "No se pudieron obtener diagn?sticos",
+    );
+
+    throw new Error(
+      `No encontr? texto extra?ble en la capa de texto del reader. Frames revisados: ${lastFrameUrls}. Diagn?stico: ${diagnostics}`,
+    );
+  }
+
+  private async getReaderDiagnostics(page: Page): Promise<string> {
+    return page.evaluate(() => {
+      const selectors = [
+        ".textLayer",
+        ".textLayer span",
+        "canvas",
+        ".page",
+        "ngx-extended-pdf-viewer",
+        "pdf-viewer",
+        "input",
+        "button",
+        "[class*=text]",
+        "[class*=page]",
+      ];
+
+      const counts = Object.fromEntries(
+        selectors.map((selector) => [selector, document.querySelectorAll(selector).length]),
+      );
+
+      const inputs = Array.from(document.querySelectorAll<HTMLInputElement>("input"))
+        .slice(0, 10)
+        .map((input) => ({
+          value: input.value,
+          placeholder: input.placeholder,
+          type: input.type,
+          id: input.id,
+          name: input.name,
+          className: input.className,
+        }));
+
+      const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
+        .slice(0, 30)
+        .map((button) => ({
+          text: button.textContent?.trim(),
+          title: button.title,
+          ariaLabel: button.getAttribute("aria-label"),
+          id: button.id,
+          className: button.className,
+          visible: Boolean(button.offsetWidth || button.offsetHeight || button.getClientRects().length),
+        }));
+
+      const pageLike = Array.from(document.querySelectorAll<HTMLElement>("[class*=page], [id*=page]"))
+        .slice(0, 30)
+        .map((element) => ({
+          tag: element.tagName,
+          id: element.id,
+          className: String(element.className),
+          text: element.textContent?.trim().slice(0, 120),
+          dataset: { ...element.dataset },
+        }));
+
+      return JSON.stringify({
+        url: location.href,
+        title: document.title,
+        counts,
+        inputs,
+        buttons,
+        pageLike,
+        bodyText: document.body.innerText.slice(0, 1000),
+      }).slice(0, 6000);
+    });
+  }
+
+
+  private async extractVisibleTextLayer(frame: Frame): Promise<string> {
+    return frame.evaluate(() => {
+      const normalize = (value: string) =>
+        value
+          .replace(/[ \t]+\n/g, "\n")
+          .replace(/\n{3,}/g, "\n\n")
+          .trim();
+
+      const pages = Array.from(document.querySelectorAll<HTMLElement>(".page"));
+      const viewportHeight = window.innerHeight;
+
+      const visiblePage =
+        pages
+          .map((element) => {
+            const rect = element.getBoundingClientRect();
+            const visibleHeight =
+              Math.min(rect.bottom, viewportHeight) - Math.max(rect.top, 0);
+
+            return { element, visibleHeight };
+          })
+          .filter(({ visibleHeight }) => visibleHeight > 0)
+          .sort((a, b) => b.visibleHeight - a.visibleHeight)[0]?.element ??
+        document.body;
+
+      const spans = Array.from(
+        visiblePage.querySelectorAll<HTMLElement>(".textLayer span"),
+      );
+      const spanText = normalize(
+        spans.map((span) => span.textContent ?? "").join("\n"),
+      );
+
+      if (spanText) return spanText;
+
+      const textLayers = Array.from(
+        visiblePage.querySelectorAll<HTMLElement>(".textLayer"),
+      );
+      return normalize(
+        textLayers.map((layer) => layer.innerText || layer.textContent || "").join("\n"),
+      );
+    });
+  }
+}
+
+
+

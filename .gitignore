@@ -1,0 +1,75 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+out/
+dist/
+build/
+release/
+
+# Electron/electron-builder
+*.blockmap
+*.dmg
+*.exe
+*.msi
+*.pkg
+*.AppImage
+*.snap
+*.deb
+*.rpm
+*.zip
+*.tar.gz
+*.tar.xz
+
+# Local env and secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# Python/OCR experiments and local models
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+spa.traineddata
+
+# Temporary/generated OCR artifacts
+.tmp-*.png
+.tmp-*.jpg
+.tmp-*.jpeg
+.tmp-*.webp
+*.tmp
+
+# Playwright/test artifacts
+playwright-report/
+test-results/
+coverage/
+
+# Local agent/tooling state
+.agents/
+.codex/
+
+# App runtime data
+*.db
+*.sqlite
+*.sqlite3
+
+# Historical experiments not needed for app packaging
+experiments/
