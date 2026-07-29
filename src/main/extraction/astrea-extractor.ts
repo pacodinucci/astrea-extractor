@@ -1,4 +1,4 @@
-﻿import type { Frame, Page } from "playwright";
+import type { Frame, Page } from "playwright";
 import {
   ASTREA_BASE_URL,
   type ExtractionRequest,
@@ -18,7 +18,7 @@ export class AstreaExtractor implements PageExtractor {
   async resolveBookcode(request: ExtractionRequest): Promise<string> {
     if (request.bookcode) return request.bookcode;
     throw new Error(
-      "El fallback por title todavía requiere desambiguación manual. Enviá bookcode para el MVP.",
+      "El fallback por title todavÃ­a requiere desambiguaciÃ³n manual. EnviÃ¡ bookcode para el MVP.",
     );
   }
 
@@ -108,18 +108,48 @@ export class AstreaExtractor implements PageExtractor {
       () => undefined,
     );
     await page.waitForTimeout(1_500);
+    await this.waitForReaderTextLayer(page);
 
     const text = await this.extractOcrTextFromReader(page, ocrProvider, openAiModel);
 
     if (!text) {
       throw new Error(
-        `La página ${requestedPage} se abrió en el reader, pero la capa de texto está vacía.`,
+        `La pÃ¡gina ${requestedPage} se abriÃ³ en el reader, pero la capa de texto estÃ¡ vacÃ­a.`,
       );
     }
 
     return text;
   }
 
+
+  private async waitForReaderTextLayer(page: Page): Promise<void> {
+    const deadline = Date.now() + 60_000;
+    let lastFrameUrls = "";
+
+    while (Date.now() < deadline) {
+      const frames = page.frames();
+      lastFrameUrls = frames.map((frame) => frame.url()).join(" | ");
+
+      for (const frame of frames) {
+        const text = await this.extractVisibleTextLayer(frame).catch(() => "");
+        if (text.replace(/\s+/g, "").length >= 10) {
+          await page.waitForTimeout(750);
+          return;
+        }
+      }
+
+      await page.waitForTimeout(500);
+    }
+
+    const diagnostics = await this.getReaderDiagnostics(page).catch(
+      (error: unknown) =>
+        error instanceof Error ? error.message : "No se pudieron obtener diagnósticos",
+    );
+
+    throw new Error(
+      `La página se abrió, pero el texto del PDF no apareció sobre el reader antes del timeout. Frames revisados: ${lastFrameUrls}. Diagnóstico: ${diagnostics}`,
+    );
+  }
 
   private async extractOcrTextFromReader(
     page: Page,
@@ -208,23 +238,91 @@ export class AstreaExtractor implements PageExtractor {
 
   private async captureReaderPageImage(page: Page): Promise<Buffer> {
     await page.waitForFunction(
-      () => Array.from(document.querySelectorAll("canvas")).some((canvas) => canvas.width > 500 && canvas.height > 500),
+      () => {
+        const hasVisibleContent = (canvas: HTMLCanvasElement) => {
+          const rect = canvas.getBoundingClientRect();
+          if (rect.width <= 100 || rect.height <= 100 || canvas.width <= 500 || canvas.height <= 500) {
+            return false;
+          }
+
+          const context = canvas.getContext("2d", { willReadFrequently: true });
+          if (!context) return false;
+
+          const sampleWidth = Math.min(canvas.width, 240);
+          const sampleHeight = Math.min(canvas.height, 240);
+          const sampleX = Math.max(0, Math.floor((canvas.width - sampleWidth) / 2));
+          const sampleY = Math.max(0, Math.floor((canvas.height - sampleHeight) / 2));
+          const pixels = context.getImageData(sampleX, sampleY, sampleWidth, sampleHeight).data;
+
+          let inkPixels = 0;
+          for (let index = 0; index < pixels.length; index += 4) {
+            const red = pixels[index] ?? 255;
+            const green = pixels[index + 1] ?? 255;
+            const blue = pixels[index + 2] ?? 255;
+            const alpha = pixels[index + 3] ?? 0;
+            if (alpha > 20 && (red < 245 || green < 245 || blue < 245)) {
+              inkPixels += 1;
+              if (inkPixels > 80) return true;
+            }
+          }
+
+          return false;
+        };
+
+        return Array.from(document.querySelectorAll<HTMLCanvasElement>(".page canvas, canvas"))
+          .some((canvas) => {
+            try {
+              return hasVisibleContent(canvas);
+            } catch {
+              return false;
+            }
+          });
+      },
       undefined,
-      { timeout: 30_000 },
+      { timeout: 45_000 },
     );
 
     const dataUrl = await page.evaluate(() => {
+      const getInkScore = (canvas: HTMLCanvasElement) => {
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        if (!context) return 0;
+
+        const sampleWidth = Math.min(canvas.width, 300);
+        const sampleHeight = Math.min(canvas.height, 300);
+        const sampleX = Math.max(0, Math.floor((canvas.width - sampleWidth) / 2));
+        const sampleY = Math.max(0, Math.floor((canvas.height - sampleHeight) / 2));
+        const pixels = context.getImageData(sampleX, sampleY, sampleWidth, sampleHeight).data;
+
+        let score = 0;
+        for (let index = 0; index < pixels.length; index += 4) {
+          const red = pixels[index] ?? 255;
+          const green = pixels[index + 1] ?? 255;
+          const blue = pixels[index + 2] ?? 255;
+          const alpha = pixels[index + 3] ?? 0;
+          if (alpha > 20 && (red < 245 || green < 245 || blue < 245)) score += 1;
+        }
+        return score;
+      };
+
       const canvases = Array.from(document.querySelectorAll<HTMLCanvasElement>(".page canvas, canvas"))
         .map((canvas) => {
           const rect = canvas.getBoundingClientRect();
+          let inkScore = 0;
+          try {
+            inkScore = getInkScore(canvas);
+          } catch {
+            inkScore = 0;
+          }
+
           return {
             canvas,
             area: canvas.width * canvas.height,
+            inkScore,
             visible: rect.width > 100 && rect.height > 100,
           };
         })
-        .filter(({ canvas, visible }) => visible && canvas.width > 500 && canvas.height > 500)
-        .sort((a, b) => b.area - a.area);
+        .filter(({ canvas, visible, inkScore }) => visible && inkScore > 80 && canvas.width > 500 && canvas.height > 500)
+        .sort((a, b) => b.inkScore - a.inkScore || b.area - a.area);
 
       const canvas = canvases[0]?.canvas;
       if (!canvas) return "";
@@ -233,7 +331,8 @@ export class AstreaExtractor implements PageExtractor {
     });
 
     if (!dataUrl.startsWith("data:image/png;base64,")) {
-      throw new Error("No pude obtener una imagen PNG de alta resoluci?n desde el canvas del reader.");
+      const diagnostics = await this.getReaderDiagnostics(page).catch(() => "Sin diagnÃ³stico");
+      throw new Error(`No pude obtener una imagen PNG con contenido visible desde el canvas del reader. DiagnÃ³stico: ${diagnostics}`);
     }
 
     return Buffer.from(dataUrl.split(",")[1], "base64");
