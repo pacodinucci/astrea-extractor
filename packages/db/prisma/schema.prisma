@@ -1,0 +1,221 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id            String    @id
+  name          String
+  email         String    @unique
+  emailVerified Boolean
+  image         String?
+  createdAt     DateTime
+  updatedAt     DateTime
+
+  sessions          Session[]
+  accounts          Account[]
+  ingestionJobs     IngestionJob[]
+  exports           BookExport[]
+  downloadEvents    BookDownloadEvent[]
+}
+
+model Session {
+  id        String   @id
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime
+  updatedAt DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Account {
+  id                    String    @id
+  userId                String
+  accountId             String
+  providerId            String
+  accessToken           String?
+  refreshToken          String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  idToken               String?
+  password              String?
+  createdAt             DateTime
+  updatedAt             DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Verification {
+  id         String    @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime?
+  updatedAt  DateTime?
+}
+
+model Book {
+  id           String     @id @default(cuid())
+  astreaBookId String     @unique
+  title        String?
+  author       String?
+  edition      String?
+  totalPages   Int?
+  status       BookStatus @default(requested)
+  extractedAt  DateTime?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  pages         BookPage[]
+  chapters      BookChapter[]
+  ingestionJobs IngestionJob[]
+  exports       BookExport[]
+  downloads     BookDownloadEvent[]
+
+  @@index([status])
+  @@index([title])
+}
+
+model BookPage {
+  id           String         @id @default(cuid())
+  bookId       String
+  pageNumber   Int
+  status       BookPageStatus @default(pending)
+  text         String?
+  errorMessage String?
+  processedAt  DateTime?
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  book Book @relation(fields: [bookId], references: [id], onDelete: Cascade)
+
+  @@unique([bookId, pageNumber])
+  @@index([bookId, status])
+}
+
+model BookChapter {
+  id        String   @id @default(cuid())
+  bookId    String
+  title     String
+  order     Int
+  startPage Int?
+  endPage   Int?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  book Book @relation(fields: [bookId], references: [id], onDelete: Cascade)
+
+  @@unique([bookId, order])
+  @@index([bookId, startPage])
+}
+
+model IngestionJob {
+  id                String             @id @default(cuid())
+  bookId            String
+  requestedByUserId String
+  status            IngestionJobStatus @default(queued)
+  mode              IngestionJobMode   @default(full_book)
+  progressTotal     Int                @default(0)
+  progressDone      Int                @default(0)
+  progressFailed    Int                @default(0)
+  startedAt         DateTime?
+  finishedAt        DateTime?
+  errorSummary      String?
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+
+  book            Book @relation(fields: [bookId], references: [id], onDelete: Cascade)
+  requestedByUser User @relation(fields: [requestedByUserId], references: [id], onDelete: Restrict)
+
+  @@index([status, createdAt])
+  @@index([bookId])
+  @@index([requestedByUserId])
+}
+
+model BookExport {
+  id                String       @id @default(cuid())
+  bookId            String
+  requestedByUserId String
+  format            ExportFormat @default(txt)
+  status            ExportStatus @default(queued)
+  fileName          String?
+  content           String?
+  errorMessage      String?
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  book            Book @relation(fields: [bookId], references: [id], onDelete: Cascade)
+  requestedByUser User @relation(fields: [requestedByUserId], references: [id], onDelete: Restrict)
+
+  @@index([bookId, format])
+  @@index([requestedByUserId])
+}
+
+model BookDownloadEvent {
+  id        String   @id @default(cuid())
+  bookId    String
+  userId    String
+  format    ExportFormat
+  createdAt DateTime @default(now())
+
+  book Book @relation(fields: [bookId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([bookId])
+  @@index([userId])
+}
+
+enum BookStatus {
+  requested
+  queued
+  processing
+  available
+  partial
+  failed
+}
+
+enum BookPageStatus {
+  pending
+  captured
+  ocr_processing
+  ready
+  failed
+  skipped
+}
+
+enum IngestionJobStatus {
+  queued
+  running
+  completed
+  partial
+  failed
+  cancelled
+}
+
+enum ExportStatus {
+  queued
+  running
+  ready
+  failed
+}
+
+enum ExportFormat {
+  txt
+}
+
+enum IngestionJobMode {
+  full_book
+  retry_failed_pages
+}

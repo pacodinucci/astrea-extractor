@@ -1,4 +1,5 @@
 import type {
+  ExtractionPageError,
   ExtractionPageResult,
   ExtractionRequest,
   OcrProvider,
@@ -14,4 +15,16 @@ export type PageExtractor = {
     ocrProvider?: OcrProvider;
     openAiModel?: OpenAiOcrModel;
   }): Promise<Omit<ExtractionPageResult, "attempts" | "status">>;
+  extractPages(args: {
+    bookcode: string;
+    pages: number[];
+    maxAttempts: number;
+    ocrProvider?: OcrProvider;
+    openAiModel?: OpenAiOcrModel;
+    onPageCompleted?: (page: ExtractionPageResult) => void;
+    onPageFailed?: (page: ExtractionPageError) => void;
+  }): Promise<{
+    pages: ExtractionPageResult[];
+    failedPages: ExtractionPageError[];
+  }>;
 };

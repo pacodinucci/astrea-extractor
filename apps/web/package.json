@@ -1,0 +1,25 @@
+{
+    "name":  "@astrea/web",
+    "version":  "0.1.0",
+    "private":  true,
+    "type":  "module",
+    "scripts":  {
+                    "dev":  "next dev --webpack",
+                    "start":  "next start",
+                    "typecheck":  "tsc --noEmit"
+                },
+    "dependencies":  {
+                         "@astrea/db":  "0.1.0",
+                         "@better-auth/prisma-adapter":  "latest",
+                         "better-auth":  "latest",
+                         "next":  "latest",
+                         "react":  "latest",
+                         "react-dom":  "latest"
+                     },
+    "devDependencies":  {
+                            "@types/node":  "latest",
+                            "@types/react":  "latest",
+                            "@types/react-dom":  "latest",
+                            "typescript":  "latest"
+                        }
+}

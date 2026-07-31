@@ -1,4 +1,4 @@
-﻿import { app } from "electron";
+import { app } from "electron";
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { ChildProcess, spawn } from "node:child_process";
@@ -10,42 +10,90 @@ import {
 import type { BrowserRuntimeStatus } from "../../shared/ipc";
 
 const DEFAULT_CDP_PORT = 9222;
+type BrowserRuntimeMode = BrowserRuntimeStatus["mode"];
 
 export class BrowserController {
   private process?: ChildProcess;
   private browser?: Browser;
   private lastError?: string;
+  private mode: BrowserRuntimeMode = "unknown";
+  private cdpKnownAvailable = false;
+  private readonly configuredCdpPort = Number(process.env.ASTREA_CDP_PORT);
 
-  readonly cdpPort = Number(process.env.ASTREA_CDP_PORT ?? DEFAULT_CDP_PORT);
+  readonly cdpPort = Number.isInteger(this.configuredCdpPort) && this.configuredCdpPort > 0
+    ? this.configuredCdpPort
+    : DEFAULT_CDP_PORT;
   readonly profilePath = join(app.getPath("userData"), "astrea-profile");
 
   async openAstrea(): Promise<BrowserRuntimeStatus> {
     try {
       this.ensureProfileDirectory();
 
-      if (!this.process || this.process.killed) {
-        const executablePath = this.getChromiumExecutablePath();
-        if (!executablePath) {
-          throw new Error(
-            "No se encontró Google Chrome/Chromium instalado. Instalá Google Chrome o configurá ASTREA_CHROMIUM_PATH con la ruta del ejecutable.",
-          );
-        }
-
-        this.process = spawn(executablePath, this.getChromiumLaunchArgs(), {
-          detached: false,
-          stdio: "ignore",
-        });
-
-        this.process.once("error", (error) => {
-          this.lastError = error.message;
-        });
+      if (await this.isCdpResponsive()) {
+        if (this.mode === "unknown") this.mode = "visible-login";
+        this.lastError = undefined;
+        return this.getStatus();
       }
 
+      if (this.mode === "background-extraction" && this.isChromiumRunning()) {
+        await this.stopChromium();
+      }
+
+      if (this.isChromiumRunning()) {
+        throw new Error(
+          `Chrome está abierto, pero CDP no responde en http://127.0.0.1:${this.cdpPort}/json/version. Cerrá esa ventana y abrí Astrea desde la app.`,
+        );
+      }
+
+      const executablePath = this.getChromiumExecutablePath();
+      if (!executablePath) {
+        throw new Error(
+          "No se encontró Google Chrome/Chromium instalado. Instalá Google Chrome o configurá ASTREA_CHROMIUM_PATH con la ruta del ejecutable.",
+        );
+      }
+
+      this.spawnChromium(executablePath, this.getVisibleLoginLaunchArgs());
+      this.mode = "visible-login";
       await this.waitForCdp();
       this.lastError = undefined;
     } catch (error) {
       this.lastError =
         error instanceof Error ? error.message : "No se pudo abrir Chromium.";
+    }
+
+    return this.getStatus();
+  }
+
+  async ensureExtractionRuntime(): Promise<BrowserRuntimeStatus> {
+    try {
+      this.ensureProfileDirectory();
+
+      if (await this.isCdpResponsive()) {
+        this.lastError = undefined;
+        return this.getStatus();
+      }
+
+      if (this.isChromiumRunning()) {
+        throw new Error(
+          `Chrome está abierto, pero CDP no responde en http://127.0.0.1:${this.cdpPort}/json/version. Cerrá esa ventana y abrí Astrea desde la app.`,
+        );
+      }
+
+      const executablePath = this.getChromiumExecutablePath();
+      if (!executablePath) {
+        throw new Error(
+          "No se encontro Google Chrome/Chromium instalado. Instala Google Chrome o configura ASTREA_CHROMIUM_PATH con la ruta del ejecutable.",
+        );
+      }
+
+      this.spawnChromium(executablePath, this.getBackgroundExtractionLaunchArgs());
+      this.mode = "background-extraction";
+      await this.waitForCdp();
+      this.lastError = undefined;
+    } catch (error) {
+      this.lastError =
+        error instanceof Error ? error.message : "No se pudo abrir Chromium para extraccion.";
+      throw new Error(this.lastError);
     }
 
     return this.getStatus();
@@ -61,8 +109,11 @@ export class BrowserController {
   }
 
   getStatus(): BrowserRuntimeStatus {
+    const isRunning = this.isChromiumRunning() || this.cdpKnownAvailable;
+
     return {
-      isRunning: Boolean(this.process && !this.process.killed),
+      isRunning,
+      mode: isRunning ? this.mode : "unknown",
       cdpPort: this.cdpPort,
       profilePath: this.profilePath,
       astreaUrl: ASTREA_BASE_URL,
@@ -71,13 +122,60 @@ export class BrowserController {
   }
 
   async dispose(): Promise<void> {
-    await this.browser?.close().catch(() => undefined);
+    await this.stopChromium();
+  }
+
+  private isChromiumRunning(): boolean {
+    return Boolean(this.process && !this.process.killed && this.process.exitCode === null);
+  }
+
+  private async stopChromium(): Promise<void> {
     this.browser = undefined;
-    this.process?.kill();
-    this.process = undefined;
+    this.cdpKnownAvailable = false;
+
+    const runningProcess = this.process;
+    if (!runningProcess || runningProcess.exitCode !== null) {
+      this.process = undefined;
+      this.mode = "unknown";
+      return;
+    }
+
+    const exited = new Promise<void>((resolve) => {
+      runningProcess.once("exit", () => resolve());
+    });
+
+    runningProcess.kill();
+    await Promise.race([
+      exited,
+      new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+    ]);
+
+    if (this.process === runningProcess) {
+      this.process = undefined;
+    }
+    this.mode = "unknown";
+  }
+
+  private spawnChromium(executablePath: string, args: string[]): void {
+    this.cdpKnownAvailable = false;
+    this.process = spawn(executablePath, args, {
+      detached: false,
+      stdio: "ignore",
+    });
+
+    this.process.once("error", (error) => {
+      this.lastError = error.message;
+    });
+
+    this.process.once("exit", () => {
+      this.mode = "unknown";
+      this.browser = undefined;
+      this.cdpKnownAvailable = false;
+    });
   }
 
   private async connect(): Promise<void> {
+    await this.waitForCdp();
     this.browser = await chromium.connectOverCDP(
       `http://127.0.0.1:${this.cdpPort}`,
       { timeout: 10_000 },
@@ -85,20 +183,39 @@ export class BrowserController {
   }
 
   private async waitForCdp(): Promise<void> {
-    const endpoint = `http://127.0.0.1:${this.cdpPort}/json/version`;
+    const endpoint = this.getCdpVersionEndpoint();
     const startedAt = Date.now();
 
-    while (Date.now() - startedAt < 10_000) {
-      try {
-        const response = await fetch(endpoint);
-        if (response.ok) return;
-      } catch {
-        // Chromium may still be starting.
+    while (Date.now() - startedAt < 20_000) {
+      if (this.process?.exitCode !== null) {
+        throw new Error("Chromium se cerró antes de habilitar CDP.");
       }
+
+      if (await this.isCdpResponsive()) return;
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
 
     throw new Error(`Chromium inició pero CDP no respondió en ${endpoint}`);
+  }
+
+  private async isCdpResponsive(): Promise<boolean> {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 1_000);
+      const response = await fetch(this.getCdpVersionEndpoint(), {
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      this.cdpKnownAvailable = response.ok;
+      return response.ok;
+    } catch {
+      this.cdpKnownAvailable = false;
+      return false;
+    }
+  }
+
+  private getCdpVersionEndpoint(): string {
+    return `http://127.0.0.1:${this.cdpPort}/json/version`;
   }
 
   private ensureProfileDirectory(): void {
@@ -107,19 +224,39 @@ export class BrowserController {
     }
   }
 
-  private getChromiumLaunchArgs(): string[] {
-    const args = [
+  private getBaseChromiumLaunchArgs(): string[] {
+    return [
       `--remote-debugging-port=${this.cdpPort}`,
       `--user-data-dir=${this.profilePath}`,
       "--no-first-run",
       "--no-default-browser-check",
       "--disable-popup-blocking",
       "--disable-features=Translate,MediaRouter,OptimizationGuideModelDownloading",
-      ASTREA_BASE_URL,
     ];
+  }
+
+  private getVisibleLoginLaunchArgs(): string[] {
+    const args = [...this.getBaseChromiumLaunchArgs(), ASTREA_BASE_URL];
 
     if (process.platform === "darwin") {
       args.splice(args.length - 1, 0, "--window-size=1280,900");
+    }
+
+    return args;
+  }
+
+  private getBackgroundExtractionLaunchArgs(): string[] {
+    const args = [
+      ...this.getBaseChromiumLaunchArgs(),
+      "--window-size=1280,900",
+      "about:blank",
+    ];
+
+    if (process.platform === "darwin") {
+      args.splice(args.length - 1, 0, "--window-position=-32000,-32000");
+      args.splice(args.length - 1, 0, "--disable-backgrounding-occluded-windows");
+    } else {
+      args.splice(args.length - 1, 0, "--start-minimized");
     }
 
     return args;

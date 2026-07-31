@@ -119,6 +119,14 @@
               "type": "integer",
               "minimum": 1
             }
+          },
+          "ocrProvider": {
+            "type": "string",
+            "enum": ["openai"]
+          },
+          "openAiModel": {
+            "type": "string",
+            "enum": ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"]
           }
         },
         "required": ["pages"],
@@ -135,7 +143,7 @@
           },
           "status": {
             "type": "string",
-            "enum": ["queued"]
+            "enum": ["queued", "processing", "completed", "completed_with_errors", "failed"]
           }
         },
         "required": ["jobId", "status"]
@@ -146,7 +154,7 @@
           "jobId": { "type": "string" },
           "status": {
             "type": "string",
-            "enum": ["queued", "processing", "completed", "failed"]
+            "enum": ["queued", "processing", "completed", "completed_with_errors", "failed"]
           },
           "bookcode": { "type": "string" },
           "title": { "type": "string" },
@@ -154,25 +162,66 @@
             "type": "array",
             "items": { "type": "integer" }
           },
+          "progress": {
+            "type": "object",
+            "properties": {
+              "total": { "type": "integer" },
+              "completed": { "type": "integer" },
+              "failed": { "type": "integer" }
+            },
+            "required": ["total", "completed", "failed"]
+          },
           "combinedText": { "type": "string" },
           "pages": {
             "type": "array",
             "items": {
-              "type": "object",
-              "properties": {
-                "page": { "type": "integer" },
-                "text": { "type": "string" },
-                "method": {
-                  "type": "string",
-                  "enum": ["pdf_text_layer", "pdf_buffer"]
-                },
-                "attempts": { "type": "integer" },
-                "status": { "type": "string", "enum": ["completed"] }
-              }
+              "$ref": "#/components/schemas/ExtractionPageResult"
             }
+          },
+          "failedPages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ExtractionPageError"
+            }
+          },
+          "error": {
+            "$ref": "#/components/schemas/ExtractionJobError"
           }
         },
-        "required": ["jobId", "status", "requestedPages", "pages"]
+        "required": ["jobId", "status", "requestedPages", "progress", "pages", "failedPages"]
+      },
+      "ExtractionPageResult": {
+        "type": "object",
+        "properties": {
+          "page": { "type": "integer" },
+          "text": { "type": "string" },
+          "method": {
+            "type": "string",
+            "enum": ["pdf_text_layer", "pdf_buffer", "ocr", "ocr_openai"]
+          },
+          "attempts": { "type": "integer" },
+          "status": { "type": "string", "enum": ["completed"] }
+        },
+        "required": ["page", "text", "method", "attempts", "status"]
+      },
+      "ExtractionPageError": {
+        "type": "object",
+        "properties": {
+          "page": { "type": "integer" },
+          "attempts": { "type": "integer" },
+          "code": { "type": "string", "enum": ["PAGE_EXTRACTION_FAILED"] },
+          "message": { "type": "string" }
+        },
+        "required": ["page", "attempts", "code", "message"]
+      },
+      "ExtractionJobError": {
+        "type": "object",
+        "properties": {
+          "page": { "type": "integer" },
+          "code": { "type": "string" },
+          "message": { "type": "string" }
+        },
+        "required": ["code", "message"]
       }
     }
   }

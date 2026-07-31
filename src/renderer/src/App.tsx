@@ -1,4 +1,4 @@
-﻿import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   AlertCircleIcon,
   CheckCircle2Icon,
@@ -38,7 +38,7 @@ import {
 } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
-import { OPENAI_OCR_MODELS, type ExtractionJob, type OpenAiOcrModel } from "@shared/extraction";
+import { OPENAI_OCR_MODELS, parsePageSelection, type ExtractionJob, type OpenAiOcrModel } from "@shared/extraction";
 import type { ApiRuntimeStatus, BrowserRuntimeStatus, OpenAiSettingsStatus } from "@shared/ipc";
 
 const API_BASE = "http://127.0.0.1:4317";
@@ -50,19 +50,9 @@ type RuntimeState = {
 
 function statusVariant(status?: ExtractionJob["status"]) {
   if (status === "completed") return "default";
+  if (status === "completed_with_errors") return "outline";
   if (status === "failed") return "destructive";
   return "secondary";
-}
-
-function parsePages(value: string): number[] {
-  return Array.from(
-    new Set(
-      value
-        .split(",")
-        .map((part) => Number(part.trim()))
-        .filter((page) => Number.isInteger(page) && page > 0),
-    ),
-  ).sort((a, b) => a - b);
 }
 
 export function App() {
@@ -78,7 +68,7 @@ export function App() {
   const [error, setError] = useState<string>();
 
   const selectedJob = jobs.find((job) => job.jobId === selectedJobId);
-  const parsedPages = useMemo(() => parsePages(pagesInput), [pagesInput]);
+  const parsedPages = useMemo(() => parsePageSelection(pagesInput), [pagesInput]);
 
   const refreshRuntime = useCallback(async () => {
     if (!window.astrea) {
@@ -211,7 +201,7 @@ export function App() {
 
       const payload = await response.json();
       if (!response.ok) {
-        setError(payload.error ?? "No se pudo crear la extracci?n.");
+        setError(payload.error ?? "No se pudo crear la extraccion.");
         return;
       }
 
@@ -331,7 +321,7 @@ export function App() {
                     aria-invalid={!parsedPages.length}
                   />
                   <FieldDescription>
-                    Lista explícita separada por comas. Máximo 100 páginas.
+                    Lista separada por comas. Usá rangos como (4-8),15. Máximo 250 páginas.
                   </FieldDescription>
                   {!parsedPages.length && (
                     <FieldError>Indicá al menos una página válida.</FieldError>
@@ -427,12 +417,15 @@ export function App() {
                         <div className="flex flex-col gap-2">
                           <Progress
                             value={
-                              (job.progress.completed / job.progress.total) *
+                              ((job.progress.completed + job.progress.failed) /
+                                job.progress.total) *
                               100
                             }
                           />
                           <span className="text-xs text-muted-foreground">
                             {job.progress.completed}/{job.progress.total}
+                            {job.progress.failed > 0 &&
+                              ` - ${job.progress.failed} fallida(s)`}
                           </span>
                         </div>
                       </TableCell>
@@ -453,8 +446,10 @@ export function App() {
                   <CardTitle>Resultado {selectedJob.jobId}</CardTitle>
                   <CardDescription>
                     {selectedJob.status === "failed"
-                      ? selectedJob.error?.message
-                      : "Texto por página y texto combinado para Claude."}
+                      ? selectedJob.error?.message ?? "No se pudo extraer ninguna pagina."
+                      : selectedJob.status === "completed_with_errors"
+                        ? `Texto parcial: ${selectedJob.progress.failed} pagina(s) no se pudieron extraer.`
+                        : "Texto por pagina y texto combinado para Claude."}
                   </CardDescription>
                 </div>
                 <Badge variant={statusVariant(selectedJob.status)}>
@@ -470,6 +465,16 @@ export function App() {
                   <TabsTrigger value="json">JSON</TabsTrigger>
                 </TabsList>
                 <TabsContent value="combined" className="flex flex-col gap-3">
+                  {selectedJob.failedPages.length > 0 && (
+                    <Alert>
+                      <AlertCircleIcon />
+                      <AlertTitle>Extraccion parcial</AlertTitle>
+                      <AlertDescription>
+                        No se pudieron extraer las paginas {selectedJob.failedPages.map((page) => page.page).join(", ")}.
+                        El texto combinado incluye solo las paginas exitosas.
+                      </AlertDescription>
+                    </Alert>
+                  )}
                   <Button
                     variant="outline"
                     disabled={!selectedJob.combinedText}
@@ -488,7 +493,7 @@ export function App() {
                   <ScrollArea className="h-96 rounded-md border">
                     <div className="flex flex-col gap-4 p-4">
                       {selectedJob.pages.map((page) => (
-                        <article key={page.page} className="flex flex-col gap-2">
+                        <article key={`completed-${page.page}`} className="flex flex-col gap-2">
                           <div className="flex items-center gap-2">
                             <Badge variant="secondary">Página {page.page}</Badge>
                             <Badge variant="outline">{page.method}</Badge>
@@ -498,6 +503,19 @@ export function App() {
                           </div>
                           <pre className="whitespace-pre-wrap rounded-md bg-muted p-3 text-xs">
                             {page.text}
+                          </pre>
+                        </article>
+                      ))}
+                      {selectedJob.failedPages.map((page) => (
+                        <article key={`failed-${page.page}`} className="flex flex-col gap-2">
+                          <div className="flex items-center gap-2">
+                            <Badge variant="destructive">Pagina {page.page}</Badge>
+                            <span className="text-xs text-muted-foreground">
+                              {page.attempts} intento(s)
+                            </span>
+                          </div>
+                          <pre className="whitespace-pre-wrap rounded-md bg-muted p-3 text-xs">
+                            {page.message}
                           </pre>
                         </article>
                       ))}

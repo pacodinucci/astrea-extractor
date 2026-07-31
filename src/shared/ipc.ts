@@ -1,5 +1,6 @@
 export type BrowserRuntimeStatus = {
   isRunning: boolean;
+  mode: "visible-login" | "background-extraction" | "unknown";
   cdpPort: number;
   profilePath: string;
   astreaUrl: string;

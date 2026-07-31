@@ -2,6 +2,7 @@ import { nanoid } from "nanoid";
 import {
   MAX_PAGE_ATTEMPTS,
   type ExtractionJob,
+  type ExtractionJobStatus,
   type ExtractionRequest,
 } from "../../shared/extraction";
 import type { PageExtractor } from "./types";
@@ -27,6 +28,7 @@ export class JobManager {
         failed: 0,
       },
       pages: [],
+      failedPages: [],
       createdAt: now,
       updatedAt: now,
     };
@@ -55,56 +57,40 @@ export class JobManager {
       });
       job.bookcode = bookcode;
 
-      for (const page of job.requestedPages) {
-        let lastError: unknown;
-
-        for (let attempt = 1; attempt <= MAX_PAGE_ATTEMPTS; attempt += 1) {
-          try {
-            const result = await this.extractor.extractPage({
-              bookcode,
-              page,
-              attempt,
-              ocrProvider: job.ocrProvider,
-              openAiModel: job.openAiModel,
-            });
-
-            job.pages.push({
-              ...result,
-              page,
-              attempts: attempt,
-              status: "completed",
-            });
-            job.progress.completed = job.pages.length;
-            this.touch(job);
-            lastError = undefined;
-            break;
-          } catch (error) {
-            lastError = error;
-          }
-        }
-
-        if (lastError) {
-          job.progress.failed = 1;
-          this.patchJob(job, {
-            status: "failed",
-            error: {
-              page,
-              code: "PAGE_EXTRACTION_FAILED",
-              message:
-                lastError instanceof Error
-                  ? lastError.message
-                  : "No se pudo extraer la página después de 3 intentos.",
-            },
-          });
-          return;
-        }
-      }
+      await this.extractor.extractPages({
+        bookcode,
+        pages: job.requestedPages,
+        maxAttempts: MAX_PAGE_ATTEMPTS,
+        ocrProvider: job.ocrProvider,
+        openAiModel: job.openAiModel,
+        onPageCompleted: (page) => {
+          job.pages.push(page);
+          job.progress.completed = job.pages.length;
+          this.touch(job);
+        },
+        onPageFailed: (page) => {
+          job.failedPages.push(page);
+          job.progress.failed = job.failedPages.length;
+          this.touch(job);
+        },
+      });
 
       job.pages.sort((a, b) => a.page - b.page);
-      job.combinedText = job.pages
-        .map((page) => `--- Página ${page.page} ---\n${page.text.trim()}`)
-        .join("\n\n");
-      this.patchJob(job, { status: "completed" });
+      job.failedPages.sort((a, b) => a.page - b.page);
+      job.combinedText = this.buildCombinedText(job);
+      const terminalStatus = this.resolveTerminalStatus(job);
+      this.patchJob(
+        job,
+        terminalStatus === "failed"
+          ? {
+              status: terminalStatus,
+              error: {
+                code: "JOB_FAILED",
+                message: "No se pudo extraer ninguna pagina solicitada.",
+              },
+            }
+          : { status: terminalStatus },
+      );
     } catch (error) {
       this.patchJob(job, {
         status: "failed",
@@ -113,10 +99,29 @@ export class JobManager {
           message:
             error instanceof Error
               ? error.message
-              : "Falló la extracción solicitada.",
+              : "Fallo la extraccion solicitada.",
         },
       });
     }
+  }
+
+  private buildCombinedText(job: ExtractionJob): string | undefined {
+    if (!job.pages.length) return undefined;
+
+    const missingPagesNotice = job.failedPages.length
+      ? `Paginas no extraidas: ${job.failedPages.map((page) => page.page).join(", ")}`
+      : undefined;
+    const successfulPagesText = job.pages
+      .map((page) => `--- Pagina ${page.page} ---\n${page.text.trim()}`)
+      .join("\n\n");
+
+    return [missingPagesNotice, successfulPagesText].filter(Boolean).join("\n\n");
+  }
+
+  private resolveTerminalStatus(job: ExtractionJob): ExtractionJobStatus {
+    if (job.pages.length === job.requestedPages.length) return "completed";
+    if (job.pages.length > 0) return "completed_with_errors";
+    return "failed";
   }
 
   private patchJob(

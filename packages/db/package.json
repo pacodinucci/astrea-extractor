@@ -1,0 +1,28 @@
+{
+    "name":  "@astrea/db",
+    "version":  "0.1.0",
+    "private":  true,
+    "type":  "module",
+    "prisma":  {
+                   "schema":  "./prisma/schema.prisma"
+               },
+    "exports":  {
+                    ".":  "./src/index.ts",
+                    "./load-env":  "./src/load-env.ts"
+                },
+    "dependencies":  {
+                         "@astrea/core":  "0.1.0",
+                         "@prisma/adapter-neon":  "latest",
+                         "@prisma/client":  "latest",
+                         "dotenv":  "latest"
+                     },
+    "devDependencies":  {
+                            "@types/node":  "latest",
+                            "prisma":  "latest",
+                            "typescript":  "latest"
+                        },
+    "scripts":  {
+                    "generate":  "prisma generate",
+                    "typecheck":  "tsc --noEmit"
+                }
+}

@@ -1,0 +1,21 @@
+{
+    "name":  "@astrea/worker",
+    "version":  "0.1.0",
+    "private":  true,
+    "type":  "module",
+    "scripts":  {
+                    "dev":  "tsx src/index.ts",
+                    "start":  "node dist/index.js",
+                    "typecheck":  "tsc --noEmit"
+                },
+    "dependencies":  {
+                         "@astrea/core":  "0.1.0",
+                         "@astrea/db":  "0.1.0",
+                         "playwright":  "latest"
+                     },
+    "devDependencies":  {
+                            "@types/node":  "latest",
+                            "tsx":  "latest",
+                            "typescript":  "latest"
+                        }
+}

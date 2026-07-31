@@ -40,9 +40,9 @@ export class AstreaExtractor implements PageExtractor {
     return this.runExclusive(async () => {
       const tab = await this.getExtractionPage();
       const provider = ocrProvider ?? "openai";
-      const text = await this.extractFromReaderUi(
+      await this.openBookReader(tab, bookcode);
+      const text = await this.extractPageFromOpenReader(
         tab,
-        bookcode,
         page,
         provider,
         openAiModel,
@@ -52,6 +52,104 @@ export class AstreaExtractor implements PageExtractor {
         page,
         text,
         method: this.methodForProvider(),
+      };
+    });
+  }
+
+  async extractPages({
+    bookcode,
+    pages,
+    maxAttempts,
+    ocrProvider,
+    openAiModel,
+    onPageCompleted,
+    onPageFailed,
+  }: {
+    bookcode: string;
+    pages: number[];
+    maxAttempts: number;
+    ocrProvider?: OcrProvider;
+    openAiModel?: OpenAiOcrModel;
+    onPageCompleted?: (page: {
+      page: number;
+      text: string;
+      method: ReturnType<AstreaExtractor["methodForProvider"]>;
+      attempts: number;
+      status: "completed";
+    }) => void;
+    onPageFailed?: (page: {
+      page: number;
+      attempts: number;
+      code: "PAGE_EXTRACTION_FAILED";
+      message: string;
+    }) => void;
+  }) {
+    return this.runExclusive(async () => {
+      const tab = await this.getExtractionPage();
+      const provider = ocrProvider ?? "openai";
+      const completedPages = [] as Array<{
+        page: number;
+        text: string;
+        method: ReturnType<AstreaExtractor["methodForProvider"]>;
+        attempts: number;
+        status: "completed";
+      }>;
+      const failedPages = [] as Array<{
+        page: number;
+        attempts: number;
+        code: "PAGE_EXTRACTION_FAILED";
+        message: string;
+      }>;
+
+      await this.openBookReader(tab, bookcode);
+
+      for (const page of pages) {
+        let lastError: unknown;
+
+        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+          try {
+            const text = await this.extractPageFromOpenReader(
+              tab,
+              page,
+              provider,
+              openAiModel,
+            );
+
+            const completedPage = {
+              page,
+              text,
+              method: this.methodForProvider(),
+              attempts: attempt,
+              status: "completed" as const,
+            };
+            completedPages.push(completedPage);
+            onPageCompleted?.(completedPage);
+            lastError = undefined;
+            break;
+          } catch (error) {
+            lastError = error;
+            await this.recoverReaderAfterPageFailure(tab, bookcode).catch(() => undefined);
+          }
+        }
+
+        if (lastError) {
+          const failedPage = {
+            page,
+            attempts: maxAttempts,
+            code: "PAGE_EXTRACTION_FAILED" as const,
+            message:
+              lastError instanceof Error
+                ? lastError.message
+                : `No se pudo extraer la pagina despues de ${maxAttempts} intentos.`,
+          };
+          failedPages.push(failedPage);
+          onPageFailed?.(failedPage);
+        }
+      }
+
+      return {
+        pages: completedPages,
+        failedPages,
       };
     });
   }
@@ -73,13 +171,17 @@ export class AstreaExtractor implements PageExtractor {
   }
 
   private async getExtractionPage(): Promise<Page> {
+    await this.browserController.ensureExtractionRuntime();
+
     if (this.extractionPage && !this.extractionPage.isClosed()) {
       return this.extractionPage;
     }
 
     const browser = await this.browserController.getConnectedBrowser();
     const context = browser.contexts()[0] ?? (await browser.newContext());
-    this.extractionPage = await context.newPage();
+    const existingAstreaPage = await this.findExistingAstreaPage(context.pages());
+
+    this.extractionPage = existingAstreaPage ?? await context.newPage();
     this.extractionPage.once("close", () => {
       this.extractionPage = undefined;
     });
@@ -87,31 +189,169 @@ export class AstreaExtractor implements PageExtractor {
     return this.extractionPage;
   }
 
-  private async extractFromReaderUi(
+  private async findExistingAstreaPage(pages: Page[]): Promise<Page | undefined> {
+    const openPages = pages.filter((page) => !page.isClosed());
+    const astreaPages = openPages.filter((page) => page.url().startsWith(ASTREA_BASE_URL));
+
+    for (const page of astreaPages) {
+      if (!(await this.isLoginPage(page))) return page;
+    }
+
+    return astreaPages[0] ?? openPages[0];
+  }
+
+  private async isLoginPage(page: Page): Promise<boolean> {
+    const title = await page.title().catch(() => "");
+    if (title.toLowerCase().includes("iniciar sesi")) return true;
+
+    return page.evaluate(() => {
+      const bodyText = document.body.innerText.toLowerCase();
+      const hasPasswordInput = Boolean(document.querySelector('input[type="password"]'));
+      return hasPasswordInput || bodyText.includes("iniciar sesi") || bodyText.includes("login");
+    }).catch(() => false);
+  }
+
+  private async openBookReader(page: Page, bookcode: string): Promise<void> {
+    const isAlreadyOnReader = page.url().includes(`/reader/${bookcode}`);
+    const hasReaderControls = isAlreadyOnReader
+      ? await page.locator("input.select-pages").count().catch(() => 0)
+      : 0;
+
+    if (hasReaderControls) {
+      await this.waitForReaderControls(page);
+      return;
+    }
+
+    const openedFromUi = await this.openBookReaderFromAstreaUi(page, bookcode);
+    if (!openedFromUi) {
+      const diagnostics = await this.getReaderDiagnostics(page).catch(() => "Sin diagnostico");
+      throw new Error(
+        `No pude abrir el reader desde la interfaz de Astrea para el libro ${bookcode}. No voy a navegar directo al reader porque Astrea rebota ese flujo al login. Diagnostico: ${diagnostics}`,
+      );
+    }
+
+    await this.waitForReaderControls(page);
+  }
+
+  private async openBookReaderFromAstreaUi(page: Page, bookcode: string): Promise<boolean> {
+    if (await this.isLoginPage(page)) return false;
+
+    await this.ensureAstreaCatalogPage(page);
+    await this.searchBookInAstreaUi(page, bookcode);
+
+    for (let step = 0; step < 3; step += 1) {
+      if (page.url().includes("/reader/")) return true;
+
+      const clicked = await this.clickReaderEntryForBook(page, bookcode);
+      if (!clicked) return false;
+
+      await page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => undefined);
+      await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => undefined);
+      await page.waitForTimeout(1_500);
+    }
+
+    return page.url().includes("/reader/");
+  }
+
+  private async ensureAstreaCatalogPage(page: Page): Promise<void> {
+    if (!page.url().startsWith(ASTREA_BASE_URL) || page.url().includes("/reader/")) {
+      await page.goto(ASTREA_BASE_URL, { waitUntil: "domcontentloaded" });
+    }
+  }
+
+  private async searchBookInAstreaUi(page: Page, bookcode: string): Promise<void> {
+    const searchInput = page.locator('input:not([type="password"])').first();
+    await searchInput.waitFor({ state: "visible", timeout: 15_000 });
+    await searchInput.fill(bookcode);
+
+    const searchButton = page.getByRole("button", { name: /buscar/i }).first();
+    if (await searchButton.isVisible().catch(() => false)) {
+      await Promise.all([
+        page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => undefined),
+        searchButton.click({ timeout: 10_000 }),
+      ]);
+    } else {
+      await searchInput.press("Enter");
+      await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => undefined);
+    }
+
+    await page.waitForTimeout(2_500);
+  }
+
+  private async clickReaderEntryForBook(page: Page, bookcode: string): Promise<boolean> {
+    return page.evaluate((code) => {
+      const isVisible = (element: HTMLElement) =>
+        Boolean(element.offsetWidth || element.offsetHeight || element.getClientRects().length);
+      const candidates = Array.from(document.querySelectorAll<HTMLElement>('a, button, [role="button"]'))
+        .filter(isVisible)
+        .map((element) => ({
+          element,
+          text: element.textContent?.toLowerCase() ?? "",
+          href: element instanceof HTMLAnchorElement ? element.href : "",
+        }));
+
+      const readerCandidate = candidates.find(({ text, href }) =>
+        href.includes(`/reader/${code}`) ||
+        (href.includes("/reader/") && (text.includes(code) || document.body.innerText.includes(code))) ||
+        (text.includes(code) && (text.includes("leer") || text.includes("reader") || text.includes("abrir") || text.includes("ver obra") || text.includes("obra")))
+      ) ?? candidates.find(({ text, href }) =>
+        href.includes("/reader/") || text.includes("leer") || text.includes("reader") || text.includes("abrir") || text.includes("ver obra") || text.includes("obra")
+      );
+
+      readerCandidate?.element.click();
+      return Boolean(readerCandidate);
+    }, bookcode);
+  }
+
+  private async recoverReaderAfterPageFailure(page: Page, bookcode: string): Promise<void> {
+    if (page.isClosed()) {
+      this.extractionPage = undefined;
+      return;
+    }
+
+    await this.openBookReader(page, bookcode);
+  }
+
+  private async waitForReaderControls(page: Page): Promise<void> {
+    await page.waitForFunction(
+      () => {
+        const bodyText = document.body.innerText.toLowerCase();
+        const hasReaderControls = Boolean(document.querySelector("input.select-pages"));
+        const hasVisiblePasswordInput = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="password"]'))
+          .some((input) => Boolean(input.offsetWidth || input.offsetHeight || input.getClientRects().length));
+        const hasReaderCanvas = document.querySelectorAll("canvas, .page, ngx-extended-pdf-viewer, pdf-viewer").length > 0;
+        const isReaderUrl = location.pathname.includes("/reader/");
+
+        return hasReaderControls || hasVisiblePasswordInput || hasReaderCanvas || isReaderUrl || bodyText.includes("iniciar sesi");
+      },
+      undefined,
+      { timeout: 60_000 },
+    );
+
+    const hasReaderControls = await page.locator("input.select-pages").count();
+    if (hasReaderControls) return;
+
+    const isLogin = await this.isLoginPage(page);
+    const diagnostics = await this.getReaderDiagnostics(page).catch(() => "Sin diagnostico");
+
+    if (isLogin) {
+      throw new Error(
+        `Astrea esta mostrando la pantalla de login. Inicia sesion en el navegador Astrea visible y reintenta. Diagnostico: ${diagnostics}`,
+      );
+    }
+
+    throw new Error(
+      `Astrea abrio el reader, pero no encontre el control de paginas (input.select-pages). Puede haber cambiado la interfaz o la portada todavia no cargo el visor. Diagnostico: ${diagnostics}`,
+    );
+  }
+
+  private async extractPageFromOpenReader(
     page: Page,
-    bookcode: string,
     requestedPage: number,
     ocrProvider: OcrProvider,
     openAiModel?: OpenAiOcrModel,
   ): Promise<string> {
-    await page.goto(`${ASTREA_BASE_URL}/reader/${bookcode}`, {
-      waitUntil: "domcontentloaded",
-    });
-
-    await page.waitForFunction(
-      () =>
-        Boolean(document.querySelector("input.select-pages")) ||
-        document.body.innerText.toLowerCase().includes("iniciar sesi?n") ||
-        document.body.innerText.toLowerCase().includes("login"),
-      undefined,
-      { timeout: 45_000 },
-    );
-
-    const hasReaderControls = await page.locator("input.select-pages").count();
-    if (!hasReaderControls) {
-      const diagnostics = await this.getReaderDiagnostics(page).catch(() => "Sin diagn?stico");
-      throw new Error(`No encontr? el control de p?gina de Astrea. Diagn?stico: ${diagnostics}`);
-    }
+    await this.waitForReaderControls(page);
 
     await page.evaluate((targetPage) => {
       const input = document.querySelector<HTMLInputElement>("input.select-pages");
@@ -143,13 +383,12 @@ export class AstreaExtractor implements PageExtractor {
 
     if (!text) {
       throw new Error(
-        `La pÃ¡gina ${requestedPage} se abriÃ³ en el reader, pero la capa de texto estÃ¡ vacÃ­a.`,
+        `La pagina ${requestedPage} se abrio en el reader, pero la capa de texto esta vacia.`,
       );
     }
 
     return text;
   }
-
 
   private async waitForReaderTextLayer(page: Page): Promise<void> {
     const deadline = Date.now() + 60_000;
@@ -723,6 +962,7 @@ export class AstreaExtractor implements PageExtractor {
         "pdf-viewer",
         "input",
         "button",
+        "a",
         "[class*=text]",
         "[class*=page]",
       ];
@@ -734,7 +974,7 @@ export class AstreaExtractor implements PageExtractor {
       const inputs = Array.from(document.querySelectorAll<HTMLInputElement>("input"))
         .slice(0, 10)
         .map((input) => ({
-          value: input.value,
+          value: input.type === "password" || input.type === "email" ? "[redacted]" : input.value ? "[present]" : "",
           placeholder: input.placeholder,
           type: input.type,
           id: input.id,
@@ -763,15 +1003,33 @@ export class AstreaExtractor implements PageExtractor {
           dataset: { ...element.dataset },
         }));
 
+      const links = Array.from(document.querySelectorAll<HTMLAnchorElement>("a"))
+        .slice(0, 40)
+        .map((link) => ({
+          text: link.textContent?.trim().slice(0, 160),
+          href: link.href,
+          visible: Boolean(link.offsetWidth || link.offsetHeight || link.getClientRects().length),
+        }));
+
+      const resultLike = Array.from(document.querySelectorAll<HTMLElement>("[class*=result], [class*=book], [class*=obra], [class*=card], mat-card"))
+        .slice(0, 30)
+        .map((element) => ({
+          tag: element.tagName,
+          className: String(element.className),
+          text: element.textContent?.trim().slice(0, 240),
+        }));
+
       return JSON.stringify({
         url: location.href,
         title: document.title,
         counts,
         inputs,
         buttons,
+        links,
+        resultLike,
         pageLike,
-        bodyText: document.body.innerText.slice(0, 1000),
-      }).slice(0, 6000);
+        bodyText: document.body.innerText.replace(/[\w.%+-]+@[\w.-]+\.[A-Za-z]{2,}/g, "[email]").slice(0, 1000),
+      }).slice(0, 9000);
     });
   }
 
